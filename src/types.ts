@@ -14,7 +14,9 @@ export interface HeadloAuthContextValue {
 }
 
 export interface HeadloProviderProps {
-  publishableKey: string
-  issuer?:        string   // defaults to Headlo's managed OAuth server
-  children:       React.ReactNode
+  publishableKey:            string
+  issuer?:                   string
+  signInFallbackRedirectUrl?: string
+  signUpFallbackRedirectUrl?: string
+  children:                  React.ReactNode
 }
