@@ -4,7 +4,8 @@ import type { HeadloAuthContextValue, HeadloProviderProps, HeadloUser } from './
 
 const DEFAULT_ISSUER  = 'https://auth.headlo.com'
 const VERIFIER_KEY    = 'headlo_pkce_verifier'
-const REFRESH_LEAD_MS = 5 * 60 * 1000  // refresh when access token has <5 min left
+const REFRESH_LEAD_MS = 10 * 1000  // TEMP for testing: refresh when access token has <10s left
+// const REFRESH_LEAD_MS = 5 * 60 * 1000  // production: refresh 5 minutes before exp
 
 // Clerk-style auth: refresh_token lives in an HttpOnly cookie set by the worker.
 // JavaScript can't read it (XSS-immune). The access JWT lives in memory only —
@@ -24,6 +25,19 @@ function decodeJwtPayload(jwt: string): { sub?: string; email?: string; name?: s
   } catch {
     return null
   }
+}
+
+// Debug logging — visible in DevTools Console. Filter by "[headlo-auth]".
+function log(msg: string, data?: Record<string, unknown>) {
+  if (data) console.log(`%c[headlo-auth]%c ${msg}`, 'color:#5dcaa5;font-weight:bold', 'color:inherit', data)
+  else      console.log(`%c[headlo-auth]%c ${msg}`, 'color:#5dcaa5;font-weight:bold', 'color:inherit')
+}
+
+function fmtSeconds(ms: number): string {
+  const s = Math.floor(ms / 1000)
+  if (s < 60) return `${s}s`
+  if (s < 3600) return `${Math.floor(s / 60)}m ${s % 60}s`
+  return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`
 }
 
 function decodeJwtExp(jwt: string): number | null {
@@ -48,15 +62,37 @@ export function HeadloProvider({ publishableKey, issuer = DEFAULT_ISSUER, signIn
   const channelRef      = React.useRef<BroadcastChannel | null>(null)
   tokenRef.current      = token
 
+  // Lazy refresh mode: timer is disabled. Refresh only happens when
+  // getToken() is called and the cached token is expired/expiring.
+  // To re-enable proactive refresh, uncomment the body below.
   function scheduleRefresh(accessToken: string) {
-    if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current)
     const expMs = decodeJwtExp(accessToken)
     if (!expMs) return
-    const delay = Math.max(0, expMs - Date.now() - REFRESH_LEAD_MS)
-    refreshTimerRef.current = setTimeout(() => { void refreshAccessToken() }, delay)
+    log(`💤 Timer disabled (lazy mode) — refresh will fire on next getToken() after expiry`, {
+      tokenExpAt: new Date(expMs).toLocaleTimeString(),
+      timeLeft:   fmtSeconds(expMs - Date.now()),
+    })
+
+    /* PROACTIVE TIMER MODE — uncomment to re-enable
+    if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current)
+    const lifetimeMs = expMs - Date.now()
+    const delay = Math.max(0, lifetimeMs - REFRESH_LEAD_MS)
+    log(`📅 Scheduled refresh`, {
+      tokenLifetime: fmtSeconds(lifetimeMs),
+      refreshLead:   fmtSeconds(REFRESH_LEAD_MS),
+      fireIn:        fmtSeconds(delay),
+      fireAt:        new Date(Date.now() + delay).toLocaleTimeString(),
+      tokenExpAt:    new Date(expMs).toLocaleTimeString(),
+    })
+    refreshTimerRef.current = setTimeout(() => {
+      log(`⏰ Timer fired — token nearing expiry, refreshing now`)
+      void refreshAccessToken()
+    }, delay)
+    */
   }
 
   function clearSession() {
+    log(`🧹 Session cleared — user signed out (in this tab)`)
     if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current)
     setToken(null)
     setUser(null)
@@ -64,26 +100,50 @@ export function HeadloProvider({ publishableKey, issuer = DEFAULT_ISSUER, signIn
 
   async function refreshAccessToken(): Promise<string | null> {
     // Concurrency guard — see prior commit for rationale.
-    if (inFlightRef.current) return inFlightRef.current
+    if (inFlightRef.current) {
+      log(`⏸️  Refresh already in-flight — returning existing promise (concurrency guard)`)
+      return inFlightRef.current
+    }
+
+    log(`🔄 POST /oauth/refresh — sending refresh cookie`)
+    const startMs = Date.now()
 
     inFlightRef.current = (async () => {
       const res = await fetch(`${issuer}/oauth/refresh`, {
         method:      'POST',
         credentials: 'include',  // send headlo_refresh HttpOnly cookie
       })
+      const took = Date.now() - startMs
       // 204 = no refresh cookie at all (anonymous visitor). Not an error,
       // just means there's no session to restore. Stay logged out silently.
-      if (res.status === 204) { clearSession(); return null }
-      if (!res.ok)            { clearSession(); return null }
+      if (res.status === 204) {
+        log(`💤 /oauth/refresh → 204 (no cookie, anonymous) — staying signed out`, { tookMs: took })
+        clearSession()
+        return null
+      }
+      if (!res.ok) {
+        log(`❌ /oauth/refresh → ${res.status} — session invalid, signing out`, { tookMs: took })
+        clearSession()
+        return null
+      }
 
       const { access_token } = await res.json() as { access_token: string }
+      const expMs = decodeJwtExp(access_token)
+      log(`✅ /oauth/refresh → 200 — got new access token`, {
+        tookMs:        took,
+        newTokenLife: expMs ? fmtSeconds(expMs - Date.now()) : '?',
+        newExpAt:     expMs ? new Date(expMs).toLocaleTimeString() : '?',
+      })
       setToken(access_token)
       scheduleRefresh(access_token)
       // Hydrate user from JWT claims — no /oauth/userinfo call needed.
       // The access token already contains sub, email, name.
       if (!user) {
         const u = userFromJwt(access_token)
-        if (u) setUser(u)
+        if (u) {
+          log(`👤 Hydrated user from JWT claims`, { email: u.email, id: u.id })
+          setUser(u)
+        }
       }
       return access_token
     })()
@@ -98,20 +158,23 @@ export function HeadloProvider({ publishableKey, issuer = DEFAULT_ISSUER, signIn
   // On mount: PKCE callback OR silent refresh from cookie
   React.useEffect(() => {
     async function init() {
+      log(`🚀 HeadloProvider mounted`, { issuer, publishableKey: publishableKey.slice(0, 12) + '...' })
       const params = new URLSearchParams(window.location.search)
       const code   = params.get('code')
 
       if (code) {
+        log(`🔑 Found ?code= in URL — exchanging PKCE auth code for tokens`)
         await handleCallback(code)
         const clean = new URL(window.location.href)
         clean.searchParams.delete('code')
         clean.searchParams.delete('state')
         window.history.replaceState({}, '', clean.toString())
       } else {
-        // Try silent refresh — succeeds if the HttpOnly cookie is present.
+        log(`🔍 No PKCE code — trying silent refresh (will succeed if cookie present)`)
         await refreshAccessToken()
       }
       setIsLoaded(true)
+      log(`✨ HeadloProvider isLoaded=true`)
     }
     init()
 
@@ -123,7 +186,10 @@ export function HeadloProvider({ publishableKey, issuer = DEFAULT_ISSUER, signIn
     channelRef.current = channel
     if (channel) {
       channel.onmessage = (e: MessageEvent) => {
-        if (e.data === 'signout') clearSession()
+        if (e.data === 'signout') {
+          log(`📡 BroadcastChannel: another tab signed out — clearing local session`)
+          clearSession()
+        }
       }
     }
 
@@ -153,13 +219,22 @@ export function HeadloProvider({ publishableKey, issuer = DEFAULT_ISSUER, signIn
     if (!res.ok) return
 
     const { access_token } = await res.json() as { access_token: string }
+    const expMs = decodeJwtExp(access_token)
+    log(`✅ PKCE exchange complete — session created`, {
+      tokenLife: expMs ? fmtSeconds(expMs - Date.now()) : '?',
+      expAt:     expMs ? new Date(expMs).toLocaleTimeString() : '?',
+    })
     setToken(access_token)
     scheduleRefresh(access_token)
     const u = userFromJwt(access_token)
-    if (u) setUser(u)
+    if (u) {
+      log(`👤 Hydrated user from JWT`, { email: u.email, id: u.id })
+      setUser(u)
+    }
   }
 
   async function signIn() {
+    log(`🚪 signIn() — generating PKCE + redirecting to /oauth/authorize`)
     const verifier  = generateCodeVerifier()
     const challenge = await generateCodeChallenge(verifier)
     localStorage.setItem(VERIFIER_KEY, verifier)
@@ -179,6 +254,7 @@ export function HeadloProvider({ publishableKey, issuer = DEFAULT_ISSUER, signIn
   }
 
   async function signOut() {
+    log(`🚪 signOut() — POST /oauth/signout + clearing local session`)
     // Best-effort revoke + cookie clear via server
     fetch(`${issuer}/oauth/signout`, {
       method:      'POST',
@@ -186,6 +262,7 @@ export function HeadloProvider({ publishableKey, issuer = DEFAULT_ISSUER, signIn
     }).catch(() => {})
 
     clearSession()
+    log(`📡 Broadcasting signout to other tabs`)
     channelRef.current?.postMessage('signout')
   }
 
@@ -193,11 +270,20 @@ export function HeadloProvider({ publishableKey, issuer = DEFAULT_ISSUER, signIn
   // or about to expire, refresh first so callers never see an expired JWT.
   const getToken = React.useCallback(async (): Promise<string | null> => {
     const current = tokenRef.current
-    if (!current) return null
+    if (!current) {
+      log(`🔍 getToken() called — no token in memory, returning null`)
+      return null
+    }
     const expMs = decodeJwtExp(current)
     if (expMs && expMs - Date.now() < REFRESH_LEAD_MS) {
+      log(`🔍 getToken() — token has < ${fmtSeconds(REFRESH_LEAD_MS)} left, refreshing first`, {
+        timeLeft: fmtSeconds(expMs - Date.now()),
+      })
       return refreshAccessToken()
     }
+    log(`🔍 getToken() — returning cached token`, {
+      timeLeft: expMs ? fmtSeconds(expMs - Date.now()) : '?',
+    })
     return current
   }, [])
 

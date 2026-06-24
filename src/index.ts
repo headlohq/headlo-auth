@@ -1,4 +1,5 @@
-export { HeadloProvider }               from './HeadloProvider'
-export { useHeadloAuth, useHeadloUser } from './hooks'
-export { SignInButton, SignOutButton }   from './components'
+export { HeadloProvider }                  from './HeadloProvider'
+export { useAuth, useUser, useHeadloAuth, useHeadloUser } from './hooks'
+export { SignInButton, SignOutButton }     from './components'
+export { useAuthFetch, createAuthFetch }   from './authFetch'
 export type { HeadloUser, HeadloAuthContextValue, HeadloProviderProps } from './types'
