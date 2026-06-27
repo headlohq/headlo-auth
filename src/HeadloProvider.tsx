@@ -51,7 +51,7 @@ function userFromJwt(jwt: string): HeadloUser | null {
   return { id: claims.sub, email: claims.email, displayName: claims.name ?? null }
 }
 
-export function HeadloProvider({ publishableKey, issuer = DEFAULT_ISSUER, signInFallbackRedirectUrl, signUpFallbackRedirectUrl, children }: HeadloProviderProps) {
+export function HeadloProvider({ publishableKey, issuer = DEFAULT_ISSUER, signInForceRedirectUrl, signInFallbackRedirectUrl, signUpForceRedirectUrl: _signUpForce, signUpFallbackRedirectUrl: _signUpFallback, children }: HeadloProviderProps) {
   const [isLoaded, setIsLoaded] = React.useState(false)
   const [user,     setUser]     = React.useState<HeadloUser | null>(null)
   const [token,    setToken]    = React.useState<string | null>(null)
@@ -233,7 +233,7 @@ export function HeadloProvider({ publishableKey, issuer = DEFAULT_ISSUER, signIn
     }
   }
 
-  async function signIn() {
+  async function signIn(opts?: { forceRedirectUrl?: string }) {
     log(`🚪 signIn() — generating PKCE + redirecting to /oauth/authorize`)
     const verifier  = generateCodeVerifier()
     const challenge = await generateCodeChallenge(verifier)
@@ -242,8 +242,11 @@ export function HeadloProvider({ publishableKey, issuer = DEFAULT_ISSUER, signIn
     const url = new URL(`${issuer}/oauth/authorize`, window.location.origin)
     url.searchParams.set('response_type', 'code')
     url.searchParams.set('client_id',     publishableKey)
-    const redirectUri = signInFallbackRedirectUrl
-      ? window.location.origin + signInFallbackRedirectUrl
+    // Resolution order (mirrors Clerk):
+    //   per-call forceRedirectUrl > signInForceRedirectUrl > signInFallbackRedirectUrl > current page
+    const target = opts?.forceRedirectUrl ?? signInForceRedirectUrl ?? signInFallbackRedirectUrl
+    const redirectUri = target
+      ? window.location.origin + target
       : window.location.origin + window.location.pathname
     url.searchParams.set('redirect_uri',          redirectUri)
     url.searchParams.set('code_challenge',        challenge)
