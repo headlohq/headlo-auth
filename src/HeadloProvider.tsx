@@ -4,6 +4,7 @@ import type { HeadloAuthContextValue, HeadloProviderProps, HeadloUser } from './
 
 const DEFAULT_ISSUER  = 'https://auth.headlo.com'
 const VERIFIER_KEY    = 'headlo_pkce_verifier'
+const USER_CACHE_KEY  = 'headlo_auth_user'   // last-known profile only, no token
 const REFRESH_LEAD_MS = 10 * 1000  // TEMP for testing: refresh when access token has <10s left
 // const REFRESH_LEAD_MS = 5 * 60 * 1000  // production: refresh 5 minutes before exp
 
@@ -11,6 +12,11 @@ const REFRESH_LEAD_MS = 10 * 1000  // TEMP for testing: refresh when access toke
 // JavaScript can't read it (XSS-immune). The access JWT lives in memory only —
 // never written to localStorage. Every page load attempts a silent refresh
 // via the cookie; if it succeeds, the user is signed in.
+//
+// One optimization: the *user profile* ({id, email, displayName}) IS written
+// to localStorage. Not sensitive on its own, and it lets us paint the signed-in
+// UI on the first render with no network round trip. Silent refresh still runs
+// in the background; if it fails, we clear the cache and drop to signed-out.
 
 export const HeadloAuthContext = React.createContext<HeadloAuthContextValue | null>(null)
 
@@ -26,6 +32,12 @@ function decodeJwtPayload(jwt: string): { sub?: string; email?: string; name?: s
     return null
   }
 }
+
+// Build marker — bump the version string on every real change so you can tell
+// at a glance whether the SDK bundle in the browser is the latest build.
+// If you don't see this line in the console, the deploy didn't ship.
+const HEADLO_AUTH_VERSION = 'cache-fix-1'
+console.log(`%c[headlo-auth]%c 📦 SDK build: ${HEADLO_AUTH_VERSION}`, 'color:#5dcaa5;font-weight:bold', 'color:inherit')
 
 // Debug logging — visible in DevTools Console. Filter by "[headlo-auth]".
 function log(msg: string, data?: Record<string, unknown>) {
@@ -51,9 +63,48 @@ function userFromJwt(jwt: string): HeadloUser | null {
   return { id: claims.sub, email: claims.email, displayName: claims.name ?? null }
 }
 
+// Read last-known user profile from localStorage — runs synchronously at
+// mount so the signed-in UI can paint on the first render without waiting
+// for /oauth/refresh. Malformed / missing values return null.
+function readCachedUser(): HeadloUser | null {
+  try {
+    const raw = localStorage.getItem(USER_CACHE_KEY)
+    if (!raw) {
+      console.log('[headlo-auth] 💾 No cached user — first paint will show Loading… until /oauth/refresh returns')
+      return null
+    }
+    const u = JSON.parse(raw) as HeadloUser
+    if (!u.id || !u.email) {
+      console.log('[headlo-auth] 💾 Cached user malformed — ignoring')
+      return null
+    }
+    console.log('[headlo-auth] 💾 Hydrated from localStorage cache — signed-in UI paints instantly', { email: u.email, id: u.id })
+    return u
+  } catch { return null }
+}
+
+function writeCachedUser(u: HeadloUser): void {
+  try {
+    localStorage.setItem(USER_CACHE_KEY, JSON.stringify(u))
+    console.log('[headlo-auth] 💾 Cached user profile → next reload will paint instantly', { email: u.email, id: u.id })
+  } catch {}
+}
+
+function clearCachedUser(): void {
+  try {
+    if (localStorage.getItem(USER_CACHE_KEY)) {
+      localStorage.removeItem(USER_CACHE_KEY)
+      console.log('[headlo-auth] 💾 Cleared cached user profile')
+    }
+  } catch {}
+}
+
 export function HeadloProvider({ publishableKey, issuer = DEFAULT_ISSUER, signInForceRedirectUrl, signInFallbackRedirectUrl, signUpForceRedirectUrl: _signUpForce, signUpFallbackRedirectUrl: _signUpFallback, children }: HeadloProviderProps) {
-  const [isLoaded, setIsLoaded] = React.useState(false)
-  const [user,     setUser]     = React.useState<HeadloUser | null>(null)
+  // Lazy init from localStorage cache: if a returning visitor had a session
+  // last time, we render "signed in" immediately. Background refresh confirms
+  // the session is still valid (or clears cache + drops to signed-out).
+  const [user,     setUser]     = React.useState<HeadloUser | null>(readCachedUser)
+  const [isLoaded, setIsLoaded] = React.useState<boolean>(() => readCachedUser() !== null)
   const [token,    setToken]    = React.useState<string | null>(null)
 
   const refreshTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -96,6 +147,7 @@ export function HeadloProvider({ publishableKey, issuer = DEFAULT_ISSUER, signIn
     if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current)
     setToken(null)
     setUser(null)
+    clearCachedUser()
   }
 
   async function refreshAccessToken(): Promise<string | null> {
@@ -138,12 +190,12 @@ export function HeadloProvider({ publishableKey, issuer = DEFAULT_ISSUER, signIn
       scheduleRefresh(access_token)
       // Hydrate user from JWT claims — no /oauth/userinfo call needed.
       // The access token already contains sub, email, name.
-      if (!user) {
-        const u = userFromJwt(access_token)
-        if (u) {
-          log(`👤 Hydrated user from JWT claims`, { email: u.email, id: u.id })
-          setUser(u)
-        }
+      // Always re-cache in case claims changed (name update, etc).
+      const u = userFromJwt(access_token)
+      if (u) {
+        if (!user) log(`👤 Hydrated user from JWT claims`, { email: u.email, id: u.id })
+        setUser(u)
+        writeCachedUser(u)
       }
       return access_token
     })()
@@ -230,6 +282,7 @@ export function HeadloProvider({ publishableKey, issuer = DEFAULT_ISSUER, signIn
     if (u) {
       log(`👤 Hydrated user from JWT`, { email: u.email, id: u.id })
       setUser(u)
+      writeCachedUser(u)
     }
   }
 
