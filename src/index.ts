@@ -1,4 +1,5 @@
 export { HeadloProvider }                  from './HeadloProvider'
+export { HeadloProviderV2 }                from './HeadloProviderV2'
 export { useAuth, useUser, useHeadloAuth, useHeadloUser } from './hooks'
 export { SignInButton, SignOutButton, SignedIn, SignedOut } from './components'
 export { useAuthFetch, createAuthFetch }   from './authFetch'

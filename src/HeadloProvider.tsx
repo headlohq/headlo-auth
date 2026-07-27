@@ -161,7 +161,10 @@ export function HeadloProvider({ publishableKey, issuer = DEFAULT_ISSUER, signIn
     const startMs = Date.now()
 
     inFlightRef.current = (async () => {
-      const res = await fetch(`${issuer}/oauth/refresh`, {
+      // client_id required — worker enforces refresh token's `azp` claim
+      // matches the caller. Prevents a compromised sibling app (same
+      // auth issuer) from silently minting tokens for this app's user.
+      const res = await fetch(`${issuer}/oauth/refresh?client_id=${encodeURIComponent(publishableKey)}`, {
         method:      'POST',
         credentials: 'include',  // send headlo_refresh HttpOnly cookie
       })
