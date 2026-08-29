@@ -28,9 +28,11 @@
   },
   "files": ["dist"],
   "scripts": {
-    "build": "tsup",
-    "dev":   "tsup --watch",
-    "tsc":   "tsc --noEmit"
+    "build":         "npm run build:sdk && npm run build:runtime",
+    "build:sdk":     "tsup",
+    "build:runtime": "tsup --config tsup.runtime.config.ts",
+    "dev":           "tsup --watch",
+    "tsc":           "tsc --noEmit"
   },
   "peerDependencies": {
     "react": ">=18"

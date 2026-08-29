@@ -1,0 +1,76 @@
+{
+  "_comment": "PROP service contract for `headlo-auth`. Paste this into the dashboard editor at /dashboard/prop/services/headlo-auth (Contract tab) — the same JSON is also served from the DB. Design: claude/propCode/headloAuthService.md § 3.",
+  "description": "OAuth / token client for Headlo — exposes sign-in / sign-out, current user, token fetch, and an authFetch helper as PROP service actions. Wraps HeadloAuthClient as a module singleton so every widget + PROP service on the page shares one auth state, cross-instance-synced with a React HeadloProviderV2 when present.",
+  "actions": [
+    {
+      "name":    "getToken",
+      "args":    {},
+      "returns": { "token": "string?", "expiresAt": "number?" }
+    },
+    {
+      "name":    "getUser",
+      "args":    {},
+      "returns": {
+        "userId":      "string?",
+        "email":       "string?",
+        "displayName": "string?",
+        "verified":    "boolean"
+      }
+    },
+    {
+      "name":    "isSignedIn",
+      "args":    {},
+      "returns": { "signedIn": "boolean" }
+    },
+    {
+      "name":    "signIn",
+      "args":    { "returnUrl": "string?" },
+      "returns": { "url": "string?" }
+    },
+    {
+      "name":    "signOut",
+      "args":    {},
+      "returns": { "signedOut": "boolean" }
+    },
+    {
+      "name":    "authFetch",
+      "args":    { "url": "string", "options": "object?" },
+      "returns": { "status": "number", "ok": "boolean", "body": "any", "headers": "object" }
+    }
+  ],
+  "events": [
+    {
+      "name":        "change",
+      "detail": {
+        "isLoaded":   "boolean",
+        "isSignedIn": "boolean",
+        "user":       "object?",
+        "expiresAt":  "number?",
+        "token":      "string?"
+      },
+      "description": "Fires on sign-in, sign-out, token refresh, or cross-instance sync from another HeadloAuthClient instance."
+    }
+  ],
+  "config_fields": [
+    {
+      "name":        "authIssuer",
+      "type":        "string",
+      "required":    true,
+      "label":       "Auth issuer URL",
+      "placeholder": "http://127.0.0.1:8787"
+    },
+    {
+      "name":        "publishableKey",
+      "type":        "string",
+      "required":    true,
+      "label":       "Publishable key",
+      "placeholder": "pk_live_..."
+    },
+    {
+      "name":        "defaultReturnUrl",
+      "type":        "string",
+      "required":    false,
+      "label":       "Default return URL after sign-in"
+    }
+  ]
+}

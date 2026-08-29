@@ -1,0 +1,6 @@
+{
+  "_comment": "LOCAL DEV config for the headlo-auth:v2 app. Paste into the Impl App tab (v2) in the dashboard. Replace publishableKey with your own pk_live_* from /dashboard/prop before saving. Prod version at ./config.prod.json.",
+  "authIssuer":       "http://127.0.0.1:8787",
+  "publishableKey":   "pk_live_REPLACE_WITH_YOUR_LOCAL_KEY",
+  "defaultReturnUrl": "/"
+}

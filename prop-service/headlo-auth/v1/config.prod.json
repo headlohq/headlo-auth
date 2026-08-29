@@ -1,0 +1,6 @@
+{
+  "_comment": "PROD config for the headlo-auth:v1 app (cookie-refresh flavor). Paste into the Impl App tab (v1) in the dashboard on production. Local dev version at ./config.local.json. Swap the publishableKey to the prod one before saving to production DB.",
+  "authIssuer":       "https://auth.headlo.com",
+  "publishableKey":   "pk_live_REPLACE_WITH_PROD_KEY",
+  "defaultReturnUrl": "/"
+}

@@ -1,5 +1,5 @@
 import React from 'react'
-import { HeadloAuthContext } from './HeadloProvider'
+import { HeadloAuthContext } from './HeadloProviderV1'
 import type { HeadloAuthContextValue, HeadloUser } from './types'
 
 function useHeadloAuthContext(): HeadloAuthContextValue {
