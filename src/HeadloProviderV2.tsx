@@ -25,6 +25,7 @@ export function HeadloProviderV2({
   issuer = DEFAULT_ISSUER,
   signInForceRedirectUrl,
   signInFallbackRedirectUrl,
+  platformAdapter,
   children,
 }: HeadloProviderProps) {
   // Client instance — owned by this provider, never re-created. Held in a
@@ -37,6 +38,7 @@ export function HeadloProviderV2({
       issuer,
       signInForceRedirectUrl,
       signInFallbackRedirectUrl,
+      platformAdapter,
     })
   }
   const client = clientRef.current
@@ -55,16 +57,60 @@ export function HeadloProviderV2({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // Wave 4 A1 — publish a widget-facing shim on window so PROP widgets and
+  // services embedded on the same React page can forward this user's V2 token
+  // (bearer + DPoP proof) through their compiler-injected exchange call. Same
+  // shape and global name as the vanilla PROP-service bundle
+  // (window.__headlo_service_headlo_auth_v2), so widget bundles don't need to
+  // distinguish React-provider vs bundle-loaded contexts.
+  //
+  // Only installs if nothing else has published the global already — an app
+  // that <script>-loads the standalone service bundle keeps the bundle's
+  // shim, and both share the same sessionStorage token + IndexedDB DPoP key
+  // so behavior converges anyway.
+  //
+  // authFetch returns the wrapped { status, ok, body, headers } shape that
+  // cap-expert/v3/client.ts + prop-bundle.ts consume. Not signed in →
+  // gracefully falls back to a plain fetch (no bearer, no DPoP) so anon
+  // exchange flows work without a signed-in user.
+  React.useEffect(() => {
+    const w = window as unknown as { __headlo_service_headlo_auth_v2?: unknown }
+    if (w.__headlo_service_headlo_auth_v2) return
+    const shim = {
+      authFetch: async (args: { url: string; options?: RequestInit }) => {
+        const url = args.url
+        const opts = args.options ?? {}
+        let res: Response
+        try {
+          res = state.isSignedIn ? await client.dpopFetch(url, opts) : await fetch(url, opts)
+        } catch {
+          res = await fetch(url, opts)
+        }
+        let body: unknown = null
+        const text = await res.text()
+        try { body = JSON.parse(text) } catch { body = text }
+        const headers: Record<string, string> = {}
+        res.headers.forEach((v, k) => { headers[k] = v })
+        return { status: res.status, ok: res.ok, body, headers }
+      },
+    }
+    w.__headlo_service_headlo_auth_v2 = shim
+    return () => {
+      if (w.__headlo_service_headlo_auth_v2 === shim) delete w.__headlo_service_headlo_auth_v2
+    }
+  }, [client, state.isSignedIn])
+
   // Bind methods once — using useCallback-like memoization via useMemo so
   // context consumers don't see new function refs every render.
   const value = React.useMemo<HeadloAuthContextValue>(() => ({
-    isLoaded:   state.isLoaded,
-    isSignedIn: state.isSignedIn,
-    user:       state.user,
-    getToken:   () => client.getToken(),
-    signIn:     (opts) => client.signIn(opts),
-    signOut:    () => client.signOut(),
-  }), [state, client])
+    isLoaded:       state.isLoaded,
+    isSignedIn:     state.isSignedIn,
+    user:           state.user,
+    getToken:       () => client.getToken(),
+    signIn:         (opts) => client.signIn(opts),
+    signOut:        () => client.signOut(),
+    publishableKey,
+  }), [state, client, publishableKey])
 
   return (
     <HeadloAuthContext.Provider value={value}>

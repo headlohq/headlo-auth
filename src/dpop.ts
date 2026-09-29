@@ -13,7 +13,26 @@
 
 import { idbPut, idbGet, idbDelete } from './idb'
 
-const KEY_STORAGE_ID = 'session_key'
+// IndexedDB key layout for DPoP session keys.
+//
+// Wave 4 Phase 1 (2026-09-07) introduces per-pk keys so the same browser
+// origin can hold multiple concurrent DPoP-bound sessions — one per
+// publishable key. Before this change, a second sign-in with a different
+// pk would overwrite the first pk's key and silently break its session
+// with DPOP_KEY_WRONG_PK on every subsequent call.
+//
+// Layout:
+//   session_key                          — legacy single-key slot (pre-Phase-1)
+//   session_key:pk_live_xxxx…            — new per-pk slots
+//
+// Migration: when getExistingKeyPair(pk) misses the pk-scoped slot but the
+// legacy slot has a value, we migrate it to the pk-scoped slot AND delete
+// the legacy slot. Preserves existing signed-in users through the upgrade
+// without forcing a re-sign-in. See getExistingKeyPair below.
+const LEGACY_KEY_STORAGE_ID = 'session_key'
+
+const keyStorageIdFor = (publishableKey?: string): string =>
+  publishableKey ? `${LEGACY_KEY_STORAGE_ID}:${publishableKey}` : LEGACY_KEY_STORAGE_ID
 
 // ── base64url encoding (spec-compliant, no padding) ───────────────────────
 
@@ -41,30 +60,54 @@ async function generateKeyPair(): Promise<CryptoKeyPair> {
   ) as Promise<CryptoKeyPair>
 }
 
-// Get the current session's key pair from IndexedDB. Generates a fresh pair
-// and persists it if none exists. Idempotent — calling this multiple times
-// in the same session returns the same key pair.
-export async function getOrCreateKeyPair(): Promise<CryptoKeyPair> {
-  const existing = await idbGet<CryptoKeyPair>(KEY_STORAGE_ID)
-  if (existing?.privateKey && existing?.publicKey) return existing
+// Get the DPoP key pair for the given publishable key from IndexedDB.
+// Generates a fresh pair and persists it under `session_key:<pk>` if none
+// exists. Idempotent — calling this multiple times in the same session
+// returns the same key pair.
+//
+// When `publishableKey` is omitted, falls back to the legacy 'session_key'
+// slot for backward compatibility with any pre-Phase-1 consumers.
+export async function getOrCreateKeyPair(publishableKey?: string): Promise<CryptoKeyPair> {
+  const existing = await getExistingKeyPair(publishableKey)
+  if (existing) return existing
   const fresh = await generateKeyPair()
-  await idbPut(KEY_STORAGE_ID, fresh)
+  await idbPut(keyStorageIdFor(publishableKey), fresh)
   return fresh
 }
 
-// Get the current session's key pair ONLY if one exists — never creates.
-// Used by the resurrection flow (POST /oauth/dpop/mint) where we want to
-// mint a fresh access token from a previously-registered key. Returns null
-// if there's no key stored — meaning there's no session to resurrect.
-export async function getExistingKeyPair(): Promise<CryptoKeyPair | null> {
-  const existing = await idbGet<CryptoKeyPair>(KEY_STORAGE_ID)
-  return existing?.privateKey && existing?.publicKey ? existing : null
+// Get the DPoP key pair for the given publishable key ONLY if one exists —
+// never creates. Used by the resurrection flow (POST /oauth/dpop/mint) and
+// by external authFetch consumers that need the current key to sign proofs.
+// Returns null when there's no key stored (never signed in for this pk).
+//
+// Migration path: if the pk-scoped slot is empty but the legacy 'session_key'
+// slot has a value, we assume this is a pre-Phase-1 sign-in and migrate the
+// key over to the pk-scoped slot (deleting the legacy slot). This keeps
+// existing signed-in users through the upgrade without a re-auth prompt.
+export async function getExistingKeyPair(publishableKey?: string): Promise<CryptoKeyPair | null> {
+  const scopedId = keyStorageIdFor(publishableKey)
+  const scoped   = await idbGet<CryptoKeyPair>(scopedId)
+  if (scoped?.privateKey && scoped?.publicKey) return scoped
+
+  // Legacy migration — only attempts when caller passed a pk (otherwise
+  // scopedId === LEGACY_KEY_STORAGE_ID and we already read it above).
+  if (publishableKey) {
+    const legacy = await idbGet<CryptoKeyPair>(LEGACY_KEY_STORAGE_ID)
+    if (legacy?.privateKey && legacy?.publicKey) {
+      await idbPut(scopedId, legacy)
+      await idbDelete(LEGACY_KEY_STORAGE_ID)
+      return legacy
+    }
+  }
+  return null
 }
 
-// Delete the stored key pair. Called on sign-out. After this, the next
-// getOrCreateKeyPair() call will generate a fresh pair.
-export async function clearKeyPair(): Promise<void> {
-  await idbDelete(KEY_STORAGE_ID)
+// Delete the stored key pair for the given publishable key. Called on
+// sign-out — clears only that pk's session so the user stays signed into
+// their other apps on the same origin (multi-pk SSO). When `publishableKey`
+// is omitted, clears the legacy 'session_key' slot (back-compat only).
+export async function clearKeyPair(publishableKey?: string): Promise<void> {
+  await idbDelete(keyStorageIdFor(publishableKey))
 }
 
 // ── public JWK + thumbprint ───────────────────────────────────────────────

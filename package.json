@@ -1,6 +1,6 @@
 {
   "name": "headlo-auth",
-  "version": "0.2.0",
+  "version": "1.1.0",
   "description": "Headlo Auth React SDK — HeadloProvider, hooks, SignInButton",
   "license": "Elastic-2.0",
   "homepage": "https://www.headlo.com",
@@ -21,26 +21,28 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "types":   "./dist/index.d.ts",
-      "import":  "./dist/index.mjs",
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
       "require": "./dist/index.js"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
-    "build":         "npm run build:sdk && npm run build:runtime",
-    "build:sdk":     "tsup",
+    "build": "npm run build:sdk && npm run build:runtime",
+    "build:sdk": "tsup",
     "build:runtime": "tsup --config tsup.runtime.config.ts",
-    "dev":           "tsup --watch",
-    "tsc":           "tsc --noEmit"
+    "dev": "tsup --watch",
+    "tsc": "tsc --noEmit"
   },
   "peerDependencies": {
     "react": ">=18"
   },
   "devDependencies": {
     "@types/react": "^19.2.14",
-    "react":        "^19.2.5",
-    "tsup":         "^8.5.1",
-    "typescript":   "^6.0.3"
+    "react": "^19.2.5",
+    "tsup": "^8.5.1",
+    "typescript": "^6.0.3"
   }
 }

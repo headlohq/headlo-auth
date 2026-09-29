@@ -15,16 +15,27 @@
 // Design: claude/propCode/headloAuthService.md § 2.1.
 
 import { generateCodeVerifier, generateCodeChallenge } from './pkce'
-import { getOrCreateKeyPair, getExistingKeyPair, clearKeyPair, dpopFetch } from './dpop'
+import { getOrCreateKeyPair, getExistingKeyPair, clearKeyPair, dpopFetch, exportPublicJwk, computeJwkThumbprint } from './dpop'
 import type { HeadloUser, SignInOptions } from './types'
 
-const VERIFIER_KEY      = 'headlo_pkce_verifier'
-const USER_CACHE_KEY    = 'headlo_auth_user'          // shared with v1 provider
-const SESSION_TOKEN_KEY = 'headlo_auth_v2_token'      // sessionStorage; per-tab; v2-only
-const REFRESH_LEAD_MS   = 10 * 1000                   // refresh when < 10s left
-const BROADCAST_CHANNEL = 'headlo_auth'               // shared with v1
-const DEBUG_LOG_KEY     = 'headlo_auth_v2_debug_log'
-const DEBUG_LOG_MAX     = 200
+// Base key names — used as-is when a client has no storageKey (backward-
+// compat default), suffixed with `:${storageKey}` when a client opts into
+// multi-instance mode. Multi-instance is what enables one renderer to hold
+// separate auth sessions per environment (auth.headlo.com vs
+// auth-local.headlo.com), each with its own token, PKCE verifier, user
+// cache and cross-tab broadcast channel.
+const VERIFIER_KEY_BASE      = 'headlo_pkce_verifier'
+const USER_CACHE_KEY_BASE    = 'headlo_auth_user'          // shared with v1 provider (unsuffixed only)
+const SESSION_TOKEN_KEY_BASE = 'headlo_auth_v2_token'      // sessionStorage; per-tab; v2-only
+const BROADCAST_CHANNEL_BASE = 'headlo_auth'               // shared with v1 (unsuffixed only)
+const REFRESH_LEAD_MS        = 10 * 1000                   // refresh when < 10s left
+const BOOTSTRAP_TIMEOUT_MS   = 8 * 1000                    // rescue: force isLoaded=true if init() stalls
+const DEBUG_LOG_KEY          = 'headlo_auth_v2_debug_log'  // debug log is process-wide, not per-instance
+const DEBUG_LOG_MAX          = 200
+
+function suffix(base: string, storageKey: string | undefined): string {
+  return storageKey ? `${base}:${storageKey}` : base
+}
 
 // ─── Persistent log — writes to localStorage as a ring buffer ───────────
 
@@ -49,7 +60,7 @@ function logExternal(msg: string, data?: Record<string, unknown>): void {
 
 // ─── JWT / storage helpers ──────────────────────────────────────────────
 
-function decodeJwtPayload(jwt: string): { sub?: string; email?: string; name?: string; exp?: number; azp?: string } | null {
+function decodeJwtPayload(jwt: string): { sub?: string; email?: string; name?: string; exp?: number; azp?: string; cnf?: { jkt?: string } } | null {
   try {
     const [, payload] = jwt.split('.')
     if (!payload) return null
@@ -60,38 +71,46 @@ function decodeJwtExp(jwt: string): number | null {
   const c = decodeJwtPayload(jwt)
   return c && typeof c.exp === 'number' ? c.exp * 1000 : null
 }
+function decodeJwtCnfJkt(jwt: string): string | null {
+  const c = decodeJwtPayload(jwt)
+  return c?.cnf?.jkt ?? null
+}
 function userFromJwt(jwt: string): HeadloUser | null {
   const c = decodeJwtPayload(jwt)
   if (!c?.sub || !c.email) return null
   return { id: c.sub, email: c.email, displayName: c.name ?? null }
 }
-function readCachedUser(): HeadloUser | null {
+// All storage helpers now take an optional `storageKey` so a single tab can
+// hold N independent sessions. Undefined preserves the pre-multi-env keys
+// so shipped users don't lose their session on upgrade.
+function readCachedUser(storageKey?: string): HeadloUser | null {
   try {
-    const raw = localStorage.getItem(USER_CACHE_KEY)
+    const raw = localStorage.getItem(suffix(USER_CACHE_KEY_BASE, storageKey))
     if (!raw) return null
     const u = JSON.parse(raw) as HeadloUser
     return u.id && u.email ? u : null
   } catch { return null }
 }
-function writeCachedUser(u: HeadloUser): void {
-  try { localStorage.setItem(USER_CACHE_KEY, JSON.stringify(u)) } catch {}
+function writeCachedUser(u: HeadloUser, storageKey?: string): void {
+  try { localStorage.setItem(suffix(USER_CACHE_KEY_BASE, storageKey), JSON.stringify(u)) } catch {}
 }
-function clearCachedUser(): void {
-  try { localStorage.removeItem(USER_CACHE_KEY) } catch {}
+function clearCachedUser(storageKey?: string): void {
+  try { localStorage.removeItem(suffix(USER_CACHE_KEY_BASE, storageKey)) } catch {}
 }
-function readSessionToken(): string | null {
-  try { return sessionStorage.getItem(SESSION_TOKEN_KEY) } catch { return null }
+function readSessionToken(storageKey?: string): string | null {
+  try { return sessionStorage.getItem(suffix(SESSION_TOKEN_KEY_BASE, storageKey)) } catch { return null }
 }
-function writeSessionToken(token: string): void {
+function writeSessionToken(token: string, storageKey?: string): void {
+  const key = suffix(SESSION_TOKEN_KEY_BASE, storageKey)
   try {
-    sessionStorage.setItem(SESSION_TOKEN_KEY, token)
-    const readback = sessionStorage.getItem(SESSION_TOKEN_KEY)
+    sessionStorage.setItem(key, token)
+    const readback = sessionStorage.getItem(key)
     if (readback !== token) {
       const msg = `⚠️ sessionStorage write verify FAILED — write:${token.length}b readback:${readback?.length ?? 'null'}`
       console.warn(`%c[headlo-auth-v2]%c ${msg}`, 'color:#7c3aed;font-weight:bold', 'color:inherit')
       logExternal(msg)
     } else {
-      const msg = `💾 Wrote + verified sessionStorage (${token.length}b, key=${SESSION_TOKEN_KEY})`
+      const msg = `💾 Wrote + verified sessionStorage (${token.length}b, key=${key})`
       console.log(`%c[headlo-auth-v2]%c ${msg}`, 'color:#7c3aed;font-weight:bold', 'color:inherit')
       logExternal(msg)
     }
@@ -101,9 +120,9 @@ function writeSessionToken(token: string): void {
     logExternal(msg)
   }
 }
-function clearSessionToken(): void {
+function clearSessionToken(storageKey?: string): void {
   try {
-    sessionStorage.removeItem(SESSION_TOKEN_KEY)
+    sessionStorage.removeItem(suffix(SESSION_TOKEN_KEY_BASE, storageKey))
     const msg = `🗑️ Cleared sessionStorage token`
     console.log(`%c[headlo-auth-v2]%c ${msg}`, 'color:#7c3aed;font-weight:bold', 'color:inherit')
     logExternal(msg)
@@ -117,6 +136,80 @@ export interface HeadloAuthClientV2Config {
   issuer:                     string
   signInForceRedirectUrl?:    string
   signInFallbackRedirectUrl?: string
+  /**
+   * Optional platform adapter. Web (default, omitted) uses `window.location`
+   * to redirect the tab for sign-in and reads the auth callback from URL
+   * query params on init. Non-web hosts (Electron desktop, mobile shells)
+   * supply an adapter that overrides those touchpoints — the OAuth callback
+   * arrives through a native channel (custom protocol handler, App Link,
+   * Universal Link) rather than a browser redirect.
+   *
+   * See headlo-desktop/src/renderer/desktop-auth-adapter.ts for the canonical
+   * Electron implementation. When omitted, behavior is 100% unchanged from
+   * the pre-adapter (web-only) implementation — purely additive.
+   */
+  platformAdapter?:           PlatformAdapter
+  /**
+   * Unique storage suffix. Enables multiple client instances to coexist in
+   * the SAME renderer with independent sessions (session token, PKCE
+   * verifier, user cache, cross-tab broadcast channel). Typical use: one
+   * client per auth-server domain when the desktop / dashboard wants to
+   * sign into local + prod concurrently.
+   *
+   * When ABSENT (default), the client uses the original unsuffixed storage
+   * keys — preserving the pre-multi-env behavior for shipped users so an
+   * upgrade doesn't sign anyone out. When PRESENT, every storage key is
+   * suffixed with `:${storageKey}`.
+   *
+   * Recommended values: the auth server's hostname (e.g. `auth.headlo.com`,
+   * `auth-local.headlo.com`) so the storage suffix stays stable across
+   * different publishable-key rotations within the same env.
+   *
+   * DPoP key pair in IndexedDB is already scoped by publishableKey in
+   * ./dpop — no additional suffixing needed there.
+   */
+  storageKey?:                string
+}
+
+/**
+ * Overrides for the web-native touchpoints in HeadloAuthClientV2. Every field
+ * is required when supplying an adapter — half-implementations produce
+ * inconsistent behavior (e.g. adapter overrides `openAuthUrl` but not
+ * `redirectUri` → authorize URL has adapter's redirect_uri, but the token
+ * exchange still uses window.location, and the server rejects the mismatch).
+ */
+export interface PlatformAdapter {
+  /**
+   * Called instead of `window.location.href = url` when signIn() needs to
+   * send the user to the OAuth authorize endpoint. Desktop opens the URL in
+   * the system browser via IPC → `shell.openExternal`. Mobile opens an
+   * in-app browser tab (SFSafariViewController / Chrome Custom Tabs).
+   */
+  openAuthUrl:  (url: string) => void | Promise<void>
+
+  /**
+   * The `redirect_uri` value sent to `/oauth/authorize` and `/oauth/token`.
+   * MUST match one of the client's allowed_redirect_uris on the auth server
+   * exactly (Phase 2 exact-URL allowlist), or the server rejects with
+   * `redirect_uri not in this client's allowed_redirect_uris`.
+   *
+   * Desktop example: `'headlo://oauth/callback'`
+   * Mobile example:  `'https://auth.headlo.com/oauth/mobile-callback'`
+   */
+  redirectUri:  string
+
+  /**
+   * Subscribe to native callback events. Fires with the auth server's
+   * `{ code, state }` when the OS routes the redirect back into the app.
+   * Return an unsubscribe function — called on client destroy() and on
+   * repeat init() calls.
+   *
+   * When present, `init()` will NOT read `window.location.search` for
+   * `code` — the adapter is the exclusive callback source. Wire this to
+   * whatever native channel the platform uses (Electron IPC event,
+   * Capacitor deep-link plugin, React Native Linking listener, etc.).
+   */
+  subscribeToCallback: (handler: (params: { code: string; state: string }) => void) => (() => void)
 }
 
 export interface AuthStateV2 {
@@ -137,7 +230,13 @@ export type AuthStateV2Listener = (state: AuthStateV2) => void
 const AUTH_CHANGE_EVENT = 'headlo:auth:change'
 
 interface AuthChangeEventDetail extends AuthStateV2 {
+  version:          'v1' | 'v2'
   sourceInstanceId: string
+  // Multi-env scope — instances with different storageKey are DIFFERENT
+  // sessions (env-local vs env-prod). Cross-instance sync only applies
+  // within the same storageKey. `null` matches the pre-multi-env default
+  // (no suffix), so single-provider setups still cross-sync as before.
+  storageKey:       string | null
 }
 
 export class HeadloAuthClientV2 {
@@ -148,6 +247,11 @@ export class HeadloAuthClientV2 {
   private inFlight:    Promise<string | null> | null = null
   private channel:     BroadcastChannel | null       = null
   private listeners:   Set<AuthStateV2Listener>        = new Set()
+
+  // Platform-adapter callback subscription. Populated in init() when config
+  // has a platformAdapter; cleared in destroy(). Guarded against
+  // re-subscription so repeated init() calls don't stack listeners.
+  private _adapterUnsubscribe: (() => void) | null = null
 
   // Per-instance identifier for cross-instance CustomEvent sync. Generated
   // once in the constructor; used to skip own dispatches on receive so a
@@ -170,8 +274,8 @@ export class HeadloAuthClientV2 {
     // as signed-out even if a profile cache from another tab is present.
     // Do NOT clear the profile cache here — that would sign the user out
     // in EVERY tab.
-    this._token    = readSessionToken()
-    this._user     = this._token ? readCachedUser() : null
+    this._token    = readSessionToken(config.storageKey)
+    this._user     = this._token ? readCachedUser(config.storageKey) : null
     this._isLoaded = this._token !== null && this._user !== null
   }
 
@@ -181,9 +285,50 @@ export class HeadloAuthClientV2 {
     log(`🚀 HeadloAuthClientV2 init`, {
       issuer:         this.config.issuer,
       publishableKey: this.config.publishableKey.slice(0, 12) + '…',
+      platform:       this.config.platformAdapter ? 'adapter' : 'web',
     })
-    const params = new URLSearchParams(window.location.search)
-    const code = params.get('code')
+
+    // Platform-adapter mode: callback arrives via a native channel (IPC deep
+    // link, Capacitor plugin, etc.). Subscribe once here; the handler fires
+    // whenever the OS routes back into the app. init() DOES NOT touch
+    // window.location — the renderer's URL is app-shell (e.g.
+    // http://localhost:5175/index.html) and never carries OAuth params.
+    if (this.config.platformAdapter) {
+      // Guard against re-subscription across repeated init() calls.
+      if (!this._adapterUnsubscribe) {
+        this._adapterUnsubscribe = this.config.platformAdapter.subscribeToCallback(({ code }) => {
+          log(`🔑 Adapter callback — exchanging PKCE + registering DPoP key`)
+          void this.handleCallback(code)
+        })
+      }
+      // Fall through to token-validity checks below (which may sign the user
+      // in from an existing session without ever needing a fresh callback).
+    }
+
+    // Rescue timer: if any await in the bootstrap block below stalls
+    // (network hang on /oauth/dpop/mint or /oauth/token/refresh-dpop, stuck
+    // IndexedDB open, unresolvable PKCE exchange), _isLoaded never flips true
+    // → both <SignedIn> and <SignedOut> render null → the page shows no auth
+    // controls at all with no error signal. Force _isLoaded=true after
+    // BOOTSTRAP_TIMEOUT_MS so consumers at minimum see signed-out UI and the
+    // user can retry. No-op if bootstrap finished normally (guarded by
+    // !_isLoaded check). The finally block clears the timer and applies the
+    // same rescue if the bootstrap body threw before its own isLoaded flip.
+    const stallTimer = setTimeout(() => {
+      if (!this._isLoaded) {
+        log(`⏱️  Bootstrap stalled >${BOOTSTRAP_TIMEOUT_MS}ms — forcing isLoaded=true so UI can render sign-in`)
+        this._isLoaded = true
+        this.emit()
+      }
+    }, BOOTSTRAP_TIMEOUT_MS)
+
+    try {
+
+    // Web-native path: look for ?code= in the current URL. Skipped entirely
+    // when an adapter is present.
+    const code = this.config.platformAdapter
+      ? null
+      : new URLSearchParams(window.location.search).get('code')
 
     if (code) {
       log(`🔑 Found ?code= in URL — exchanging PKCE + registering DPoP key`)
@@ -193,6 +338,48 @@ export class HeadloAuthClientV2 {
       clean.searchParams.delete('state')
       window.history.replaceState({}, '', clean.toString())
     } else if (this._token) {
+      // Guard: a DPoP-bound token (cnf.jkt present) is useless without its
+      // referenced key in IndexedDB. If the key was cleared out of band —
+      // storage eviction, DevTools delete, mid-clear-reload race, cross-tab
+      // signout leak — the token is dead weight and every authFetch will
+      // throw "no DPoP key". Detect that state at init and clear cleanly
+      // instead of letting a stale token silently survive across reloads.
+      //
+      // Extended 2026-09-02: also verify the stored key's thumbprint actually
+      // MATCHES the token's cnf.jkt. Same-DB-different-key case surfaces as
+      // DPOP_JKT_MISMATCH at server side otherwise (token signed against one
+      // key, IDB has a different key from a later re-sign-in). Now caught
+      // and cleared at init instead of leaking a mismatch to the server.
+      const cnfJkt = decodeJwtCnfJkt(this._token)
+      if (cnfJkt) {
+        const keyPair = await getExistingKeyPair(this.config.publishableKey)
+        if (!keyPair) {
+          log(`⚠️  Cached token references missing DPoP key (jkt=${cnfJkt.slice(0, 8)}…) — clearing session`)
+          this.clearSession()
+          this._isLoaded = true
+          this.emit()
+          return
+        }
+        // Verify the stored key actually matches the token's binding
+        try {
+          const jwk = await exportPublicJwk(keyPair)
+          const storedJkt = await computeJwkThumbprint(jwk)
+          if (storedJkt !== cnfJkt) {
+            log(`⚠️  Cached token cnf.jkt=${cnfJkt.slice(0, 8)}… doesn't match IndexedDB key jkt=${storedJkt.slice(0, 8)}… — clearing session`)
+            this.clearSession()
+            this._isLoaded = true
+            this.emit()
+            return
+          }
+        } catch (e) {
+          log(`⚠️  Could not compute stored key thumbprint — clearing session as precaution`, { error: String(e) })
+          this.clearSession()
+          this._isLoaded = true
+          this.emit()
+          return
+        }
+      }
+
       // Fresh-token fast path — if cached token has > REFRESH_LEAD_MS left,
       // trust it and skip the network round-trip. Dramatically reduces
       // refresh traffic on rapid navigation.
@@ -214,14 +401,37 @@ export class HeadloAuthClientV2 {
     this._isLoaded = true
     this.emit()
 
-    // BroadcastChannel for cross-tab signout.
+    } finally {
+      clearTimeout(stallTimer)
+      // Belt-and-suspenders: if any await above threw before its own
+      // isLoaded flip, still force the flag so consumers aren't stuck on a
+      // blank render forever.
+      if (!this._isLoaded) {
+        log(`⚠️  Bootstrap threw before isLoaded flip — forcing true so UI can render`)
+        this._isLoaded = true
+        this.emit()
+      }
+    }
+
+    // BroadcastChannel for cross-tab signout — pk-scoped so signing out of
+    // pk_A in tab 1 doesn't kill pk_B's session in tab 2 (multi-pk SSO).
+    //
+    // Legacy string payload ('signout') tolerated for back-compat with
+    // any pre-Phase-1 tab that's still open at upgrade time — it signs
+    // out ALL pks in the receiving tab (matches pre-Phase-1 behavior).
     this.channel = typeof BroadcastChannel === 'function'
-      ? new BroadcastChannel(BROADCAST_CHANNEL)
+      ? new BroadcastChannel(suffix(BROADCAST_CHANNEL_BASE, this.config.storageKey))
       : null
     if (this.channel) {
       this.channel.onmessage = (e: MessageEvent) => {
-        if (e.data === 'signout') {
-          log(`📡 BroadcastChannel: signout from another tab`)
+        // Two payload shapes: pre-Phase-1 string 'signout' (all-pks kill)
+        // OR Phase-1 object { type: 'signout', pk } (this-pk-only kill).
+        const data = e.data
+        if (data === 'signout') {
+          log(`📡 BroadcastChannel: legacy signout from another tab — clearing session`)
+          this.clearSession()
+        } else if (data && typeof data === 'object' && data.type === 'signout' && data.pk === this.config.publishableKey) {
+          log(`📡 BroadcastChannel: signout for pk=${data.pk} from another tab`)
           this.clearSession()
         }
       }
@@ -245,6 +455,10 @@ export class HeadloAuthClientV2 {
     if (this.boundExternalChange && typeof window !== 'undefined') {
       window.removeEventListener(AUTH_CHANGE_EVENT, this.boundExternalChange)
       this.boundExternalChange = null
+    }
+    if (this._adapterUnsubscribe) {
+      this._adapterUnsubscribe()
+      this._adapterUnsubscribe = null
     }
   }
 
@@ -275,7 +489,12 @@ export class HeadloAuthClientV2 {
     const s = this.getState()
     this.notifyLocal(s)
     if (typeof window !== 'undefined') {
-      const detail: AuthChangeEventDetail = { ...s, sourceInstanceId: this.instanceId }
+      const detail: AuthChangeEventDetail = {
+        version:          'v2',
+        ...s,
+        sourceInstanceId: this.instanceId,
+        storageKey:       this.config.storageKey ?? null,
+      }
       window.dispatchEvent(new CustomEvent(AUTH_CHANGE_EVENT, { detail }))
     }
   }
@@ -294,6 +513,17 @@ export class HeadloAuthClientV2 {
   private handleExternalChange(e: CustomEvent<AuthChangeEventDetail>): void {
     const detail = e.detail
     if (!detail || detail.sourceInstanceId === this.instanceId) return
+    // Version guard — v1 clients also dispatch on this event name for
+    // external listeners. Ignoring v1 state here prevents v1's null state
+    // from overwriting v2's signed-in state on pages that mount both
+    // providers. See "close-tab + open-in-new-tab" bug notes in client-v1.ts.
+    if (detail.version !== 'v2') return
+    // Multi-env scope guard — only cross-sync between instances with the
+    // same storageKey. Different envs are separate sessions; without this
+    // filter, signing out of prod would sign you out of dev too.
+    // Null == null still matches (pre-multi-env single-provider default).
+    const mine = this.config.storageKey ?? null
+    if (detail.storageKey !== mine) return
     // Only mutate if state actually differs — avoid spurious re-renders.
     if (this._token === detail.token && this._user?.id === detail.user?.id && this._isLoaded === detail.isLoaded) return
     log(`🔗 Cross-instance sync — applying state from ${detail.sourceInstanceId.slice(0, 8)}…`, {
@@ -328,45 +558,100 @@ export class HeadloAuthClientV2 {
   // access token (auto-refreshes if near expiry), signs a per-request proof
   // for (method, url), and dispatches. Throws if not signed in or if the
   // DPoP key is missing (session was signed out but token cache is stale).
+  //
+  // On 401, force-refreshes the token and retries once. Closes the narrow
+  // stale-token race where getToken()'s REFRESH_LEAD_MS margin + clock skew
+  // + network latency lets a squeaking-past-expiry token slip out. Retry
+  // only fires when the server disagrees with our expiry view — a legitimate
+  // 401 (revoked session, wrong scope) is surfaced after refresh returns the
+  // same 401 or refresh itself fails.
   async dpopFetch(url: string, init: RequestInit = {}): Promise<Response> {
-    const token = await this.getToken()
-    if (!token) throw new Error('not signed in — call signIn() first')
-    const keyPair = await getExistingKeyPair()
+    const keyPair = await getExistingKeyPair(this.config.publishableKey)
     if (!keyPair) throw new Error('no DPoP key in IndexedDB — session may have been signed out')
 
     const method  = ((init.method as string | undefined) ?? 'GET').toUpperCase()
     const headers = init.headers as Record<string, string> | undefined
+    const body    = init.body as BodyInit | null | undefined
 
-    return dpopFetch(url, {
-      method,
-      keyPair,
-      accessToken: token,
-      headers,
-      body:        init.body as BodyInit | null | undefined,
-    })
+    const dispatch = async (token: string): Promise<Response> =>
+      dpopFetch(url, { method, keyPair, accessToken: token, headers, body })
+
+    const firstToken = await this.getToken()
+    if (!firstToken) throw new Error('not signed in — call signIn() first')
+    const res = await dispatch(firstToken)
+
+    // Retry-on-401: server says the token is bad. Force a refresh (bypasses
+    // getToken()'s lead-time check) and retry once with the fresh token.
+    // Only 401 triggers retry — 403/5xx are surfaced as-is.
+    if (res.status === 401) {
+      log(`🔁 dpopFetch 401 — forcing refresh + retry`, { url })
+      const refreshed = await this.refreshAccessToken()
+      if (refreshed && refreshed !== firstToken) {
+        return dispatch(refreshed)
+      }
+      log(`⚠️ dpopFetch retry skipped — refresh returned ${refreshed === null ? 'null' : 'same token'}`)
+    }
+
+    return res
   }
 
   async signIn(opts?: SignInOptions): Promise<void> {
-    log(`🚪 signIn() — generating PKCE + redirecting`)
+    log(`🚪 signIn() — generating PKCE + ${this.config.platformAdapter ? 'opening system browser' : 'redirecting'}`)
     const verifier  = generateCodeVerifier()
     const challenge = await generateCodeChallenge(verifier)
-    localStorage.setItem(VERIFIER_KEY, verifier)
+    localStorage.setItem(suffix(VERIFIER_KEY_BASE, this.config.storageKey), verifier)
 
-    const url = new URL(`${this.config.issuer}/oauth/authorize`, window.location.origin)
+    // Non-web hosts get the adapter's fixed redirect_uri; web hosts fall back
+    // to the current pathname (or an explicit forceRedirectUrl override).
+    const redirectUri = this.config.platformAdapter
+      ? this.config.platformAdapter.redirectUri
+      : (() => {
+          const target = opts?.forceRedirectUrl
+            ?? this.config.signInForceRedirectUrl
+            ?? this.config.signInFallbackRedirectUrl
+          return target
+            ? window.location.origin + target
+            : window.location.origin + window.location.pathname
+        })()
+
+    const authorizeBase = this.config.platformAdapter
+      ? this.config.issuer
+      : window.location.origin
+    const url = new URL(`${this.config.issuer}/oauth/authorize`, authorizeBase)
     url.searchParams.set('response_type', 'code')
     url.searchParams.set('client_id',     this.config.publishableKey)
-    const target = opts?.forceRedirectUrl
-      ?? this.config.signInForceRedirectUrl
-      ?? this.config.signInFallbackRedirectUrl
-    const redirectUri = target
-      ? window.location.origin + target
-      : window.location.origin + window.location.pathname
     url.searchParams.set('redirect_uri',          redirectUri)
     url.searchParams.set('code_challenge',        challenge)
     url.searchParams.set('code_challenge_method', 'S256')
     url.searchParams.set('scope',                 'openid email profile')
 
-    window.location.href = url.toString()
+    // OIDC prompt=login → server skips silent-SSO short-circuit and renders
+    // the login form even when a valid `headlo_session` cookie exists on
+    // the auth origin. See routes/oauth.ts:911-947. Opt-in via
+    // SignInOptions.forceLogin — default preserves existing auto-login UX.
+    if (opts?.forceLogin) {
+      url.searchParams.set('prompt', 'login')
+    }
+
+    // Log the full authorize URL so debug pages (persistent log viewer on
+    // /abs-test) can show exactly where the user is being sent. localStorage
+    // write is synchronous → lands before the navigation kicks in below.
+    // Safe to log: client_id is a public pk_live_, code_challenge is a
+    // public one-way hash of the verifier, no secrets in the URL.
+    log(`🔗 authorize URL → ${url.toString()}`, {
+      redirect_uri: redirectUri,
+      client_id:    this.config.publishableKey,
+    })
+
+    if (this.config.platformAdapter) {
+      // Adapter opens the URL in whatever native surface the platform uses —
+      // system browser (Electron), in-app browser (mobile). Renderer stays
+      // put; callback arrives via subscribeToCallback later.
+      await this.config.platformAdapter.openAuthUrl(url.toString())
+    } else {
+      // Web-native: hard-navigate the tab.
+      window.location.href = url.toString()
+    }
   }
 
   async signOut(): Promise<void> {
@@ -374,7 +659,7 @@ export class HeadloAuthClientV2 {
     // Best-effort revoke — fire and forget, don't block UX
     const currentToken = this._token
     if (currentToken) {
-      const keyPair = await getOrCreateKeyPair().catch(() => null)
+      const keyPair = await getOrCreateKeyPair(this.config.publishableKey).catch(() => null)
       if (keyPair) {
         const revokeUrl = `${this.config.issuer}/oauth/dpop/revoke`
         dpopFetch(revokeUrl, {
@@ -387,17 +672,27 @@ export class HeadloAuthClientV2 {
       }
     }
     this.clearSession()
-    this.channel?.postMessage('signout')
+    // Broadcast the pk-scoped signout to other tabs on the same origin.
+    // Object payload — old string-tolerant receivers still work; new
+    // per-pk receivers ignore this if their pk doesn't match.
+    this.channel?.postMessage({ type: 'signout', pk: this.config.publishableKey })
   }
 
   // ─── Internals — moved verbatim from HeadloProviderV2 ─────────────────
 
   private async handleCallback(code: string): Promise<void> {
-    const verifier = localStorage.getItem(VERIFIER_KEY)
+    const verifierKey = suffix(VERIFIER_KEY_BASE, this.config.storageKey)
+    const verifier = localStorage.getItem(verifierKey)
     if (!verifier) return
-    localStorage.removeItem(VERIFIER_KEY)
+    localStorage.removeItem(verifierKey)
 
-    // Step 1: standard PKCE exchange
+    // Step 1: standard PKCE exchange. redirect_uri MUST match what signIn()
+    // sent to /oauth/authorize — the auth server compares them and rejects
+    // mismatches. In web mode that's the tab's current URL; in adapter mode
+    // it's the adapter's fixed redirectUri (e.g. headlo://oauth/callback).
+    const redirectUri = this.config.platformAdapter
+      ? this.config.platformAdapter.redirectUri
+      : window.location.origin + window.location.pathname
     const tokenRes = await fetch(`${this.config.issuer}/oauth/token`, {
       method:      'POST',
       credentials: 'include',
@@ -405,7 +700,7 @@ export class HeadloAuthClientV2 {
       body: new URLSearchParams({
         grant_type:    'authorization_code',
         code,
-        redirect_uri:  window.location.origin + window.location.pathname,
+        redirect_uri:  redirectUri,
         client_id:     this.config.publishableKey,
         code_verifier: verifier,
       }),
@@ -419,7 +714,7 @@ export class HeadloAuthClientV2 {
 
     // Step 2: generate DPoP key + register it
     log(`🔐 Registering DPoP key with /oauth/dpop/register`)
-    const keyPair = await getOrCreateKeyPair()
+    const keyPair = await getOrCreateKeyPair(this.config.publishableKey)
     const registerUrl = `${this.config.issuer}/oauth/dpop/register`
     const regRes = await dpopFetch(registerUrl, {
       method:      'POST',
@@ -458,7 +753,7 @@ export class HeadloAuthClientV2 {
 
     this.inFlight = (async () => {
       try {
-        const keyPair = await getOrCreateKeyPair()
+        const keyPair = await getOrCreateKeyPair(this.config.publishableKey)
         const url = `${this.config.issuer}/oauth/token/refresh-dpop`
         const res = await dpopFetch(url, {
           method:      'POST',
@@ -469,12 +764,23 @@ export class HeadloAuthClientV2 {
         })
         const took = Date.now() - startMs
 
-        // Only 401/403 = server explicitly killed this session. Any other
-        // non-2xx (5xx, transient) — keep the token in sessionStorage and
-        // let the next attempt retry. Stored token is still valid until exp.
+        // Match the discrimination pattern used by mintFromDpopKey — only
+        // DPOP_KEY_REVOKED means server explicitly killed the session and
+        // we should clear local state. Other 401/403 error codes (WRONG_PK,
+        // UNREGISTERED, JKT_MISMATCH) mean the session is fine but this
+        // specific refresh attempt won't work — usually because the caller
+        // switched pk mid-session, or the DPoP key rotated. Keep the token
+        // in sessionStorage; a future refresh under the original pk will
+        // succeed or the user will sign in fresh.
         if (res.status === 401 || res.status === 403) {
-          log(`❌ /oauth/token/refresh-dpop → ${res.status} — session invalid, signing out`, { tookMs: took })
-          this.clearSession()
+          const body = await res.json().catch(() => null) as { error?: string } | null
+          const errCode = typeof body?.error === 'string' ? body.error : ''
+          if (errCode === 'DPOP_KEY_REVOKED') {
+            log(`❌ /oauth/token/refresh-dpop → ${res.status} DPOP_KEY_REVOKED — clearing local`, { tookMs: took })
+            this.clearSession()
+            return null
+          }
+          log(`⚠️ /oauth/token/refresh-dpop → ${res.status} ${errCode || 'unspecified'} — keeping session (refresh failed but token cache preserved)`, { tookMs: took })
           return null
         }
         if (!res.ok) {
@@ -508,7 +814,7 @@ export class HeadloAuthClientV2 {
     log(`🔮 Attempting resurrection via /oauth/dpop/mint`)
     const startMs = Date.now()
 
-    const keyPair = await getExistingKeyPair()
+    const keyPair = await getExistingKeyPair(this.config.publishableKey)
     if (!keyPair) {
       log(`💤 No DPoP key in IndexedDB — nothing to resurrect`)
       return null
@@ -525,8 +831,29 @@ export class HeadloAuthClientV2 {
       const took = Date.now() - startMs
 
       if (res.status === 401 || res.status === 403) {
-        log(`❌ /oauth/dpop/mint → ${res.status} — key revoked, clearing local`, { tookMs: took })
-        this.clearSession()
+        // Server distinguishes three failure modes (see /oauth/dpop/mint):
+        //   DPOP_KEY_REVOKED       — server explicitly killed the key.
+        //                            Local state is dead weight, clear it.
+        //   DPOP_KEY_WRONG_PK      — key valid, wrong pk on THIS page.
+        //                            Common in dev when pages use different
+        //                            pks against the same shared IDB.
+        //                            Keep session; a future mint on the
+        //                            correct pk will resurrect.
+        //   DPOP_KEY_UNREGISTERED  — server doesn't know this key. Could
+        //                            be dev reset, transient DB glitch,
+        //                            or genuinely wiped. Prefer keeping
+        //                            local state over aggressive signout.
+        // Only REVOKED triggers clearSession — everything else preserves
+        // local key + session, logs a warning, and returns null so the
+        // caller sees "not signed in for now" without losing state.
+        const body = await res.json().catch(() => null) as { error?: string } | null
+        const errCode = typeof body?.error === 'string' ? body.error : ''
+        if (errCode === 'DPOP_KEY_REVOKED') {
+          log(`❌ /oauth/dpop/mint → ${res.status} DPOP_KEY_REVOKED — clearing local`, { tookMs: took })
+          this.clearSession()
+          return null
+        }
+        log(`⚠️ /oauth/dpop/mint → ${res.status} ${errCode || 'unspecified'} — keeping session`, { tookMs: took })
         return null
       }
       if (!res.ok) {
@@ -552,11 +879,11 @@ export class HeadloAuthClientV2 {
   // refreshAccessToken, mintFromDpopKey. Emits state change to subscribers.
   private setTokenAndUser(token: string): void {
     this._token = token
-    writeSessionToken(token)
+    writeSessionToken(token, this.config.storageKey)
     const u = userFromJwt(token)
     if (u) {
       this._user = u
-      writeCachedUser(u)
+      writeCachedUser(u, this.config.storageKey)
     }
     this.emit()
   }
@@ -570,9 +897,14 @@ export class HeadloAuthClientV2 {
     log(`🧹 Session cleared — caller: ${stack}`)
     this._token = null
     this._user  = null
-    clearSessionToken()
-    clearCachedUser()
-    void clearKeyPair()
+    clearSessionToken(this.config.storageKey)
+    clearCachedUser(this.config.storageKey)
+    // Only clear THIS pk's key — other apps on the same origin (multi-pk
+    // SSO) keep their sessions intact. Pre-Phase-1 fallback: also clear
+    // the legacy 'session_key' slot so a stale pre-migration key doesn't
+    // linger in IDB forever on rare edge paths.
+    void clearKeyPair(this.config.publishableKey)
+    void clearKeyPair()   // legacy back-compat — cleanup only, harmless if already gone
     this.emit()
   }
 }

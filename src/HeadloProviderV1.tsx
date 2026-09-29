@@ -64,13 +64,14 @@ export function HeadloProviderV1({
   // useMemo the context value so consumers don't see new function refs
   // every render — matches ref stability of the old inline useCallback.
   const value = React.useMemo<HeadloAuthContextValue>(() => ({
-    isLoaded:   state.isLoaded,
-    isSignedIn: state.isSignedIn,
-    user:       state.user,
-    getToken:   () => client.getToken(),
-    signIn:     (opts) => client.signIn(opts),
-    signOut:    () => client.signOut(),
-  }), [state, client])
+    isLoaded:       state.isLoaded,
+    isSignedIn:     state.isSignedIn,
+    user:           state.user,
+    getToken:       () => client.getToken(),
+    signIn:         (opts) => client.signIn(opts),
+    signOut:        () => client.signOut(),
+    publishableKey,
+  }), [state, client, publishableKey])
 
   return (
     <HeadloAuthContext.Provider value={value}>

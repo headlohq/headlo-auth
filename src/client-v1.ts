@@ -26,11 +26,19 @@ const USER_CACHE_KEY    = 'headlo_auth_user'       // shared with v2
 const REFRESH_LEAD_MS   = 10 * 1000                // refresh when < 10s left
 const BROADCAST_CHANNEL = 'headlo_auth'            // shared with v2
 
-// ─── Cross-instance sync event (shared with v2) ─────────────────────────
+// ─── Cross-instance sync event ─────────────────────────
+// Event name is SHARED with v2 for external listeners (headlo-auth-button
+// v2 component, PropAuthV2Demo) that trigger a refresh on any auth change.
+// But the state-sync inside handleExternalChange must be version-scoped —
+// V1 syncing to V2's state (or vice versa) causes the "close-tab + open-in-
+// new-tab signs me out" bug: fresh V2 client init emits state=null, V1
+// listens, V1 overwrites its signed-in state with null. Fix: tag events
+// with version, ignore mismatched versions in handleExternalChange.
 
 const AUTH_CHANGE_EVENT = 'headlo:auth:change'
 
 interface AuthChangeEventDetail {
+  version:          'v1' | 'v2'
   isLoaded:         boolean
   isSignedIn:       boolean
   user:             HeadloUser | null
@@ -226,7 +234,7 @@ export class HeadloAuthClientV1 {
     const s = this.getState()
     this.notifyLocal(s)
     if (typeof window !== 'undefined') {
-      const detail: AuthChangeEventDetail = { ...s, sourceInstanceId: this.instanceId }
+      const detail: AuthChangeEventDetail = { version: 'v1', ...s, sourceInstanceId: this.instanceId }
       window.dispatchEvent(new CustomEvent(AUTH_CHANGE_EVENT, { detail }))
     }
   }
@@ -238,6 +246,11 @@ export class HeadloAuthClientV1 {
   private handleExternalChange(e: CustomEvent<AuthChangeEventDetail>): void {
     const detail = e.detail
     if (!detail || detail.sourceInstanceId === this.instanceId) return
+    // Version guard — v2 clients also dispatch on this event name for
+    // external listeners (auth-button, PropAuthV2Demo). Ignoring their
+    // state here prevents v2's null state from overwriting v1's signed-in
+    // state on pages that mount both providers.
+    if (detail.version !== 'v1') return
     if (this._token === detail.token && this._user?.id === detail.user?.id && this._isLoaded === detail.isLoaded) return
     log(`🔗 Cross-instance sync — applying state from ${detail.sourceInstanceId.slice(0, 8)}…`, {
       signedIn: detail.isSignedIn,
@@ -290,6 +303,11 @@ export class HeadloAuthClientV1 {
     url.searchParams.set('code_challenge',        challenge)
     url.searchParams.set('code_challenge_method', 'S256')
     url.searchParams.set('scope',                 'openid email profile')
+
+    // OIDC prompt=login — opt-in via SignInOptions.forceLogin, same as v2.
+    if (opts?.forceLogin) {
+      url.searchParams.set('prompt', 'login')
+    }
 
     window.location.href = url.toString()
   }
