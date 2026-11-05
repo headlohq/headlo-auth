@@ -20,6 +20,10 @@ export default defineConfig({
   entry: {
     'client-runtime-v1': 'src/client-runtime-v1.ts',    // v1 (cookie)
     'client-runtime-v2': 'src/client-runtime-v2.ts',    // v2 (DPoP)
+    // Wave 4 B.7 — universal install script. Zero-config `<script>` tag that
+    // reads data-pk from itself, derives issuer, mounts One Tap + floating
+    // "Sign in with Headlo" button. Served by the worker at /button.js.
+    'universal-button':  'src/universal-button.ts',
   },
   format:     ['iife'],
   // tsup wraps each entry's default export in `{__esModule, default}` under

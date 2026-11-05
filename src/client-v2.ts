@@ -131,11 +131,60 @@ function clearSessionToken(storageKey?: string): void {
 
 // ─── Public API ─────────────────────────────────────────────────────────
 
+// ─── Revocation markers (SSO Wave 1 B.8 close-out — auto-sign-out) ─────
+//
+// Server-side 401 error codes that definitively mean "this session is gone,
+// clear local state immediately." Any other 401 (DPOP_KEY_UNREGISTERED,
+// DPOP_KEY_WRONG_PK, etc.) is kept-session-with-warning — session may be
+// recoverable on next page load / correct-pk mint.
+//
+// Sources:
+//   SESSION_REVOKED              — /oauth/token/refresh-dpop (signout-all fired)
+//   REVOKED_BY_PASSWORD_RESET    — /oauth/refresh (user bumped session_epoch)
+//   REVOKED                      — /oauth/refresh (KV signout:<sid> set)
+//   LEGACY_TOKEN_REAUTH_REQUIRED — /oauth/refresh (pre-azp token)
+//   DPOP_KEY_REVOKED             — /oauth/token/refresh-dpop + /oauth/dpop/mint
+//   CONSENT_REVOKED              — /oauth/token/refresh-dpop + /oauth/dpop/mint
+//                                  (user revoked merchant on /account page —
+//                                   Wave 2 B.9 follow-up, 2026-10-25)
+//
+// Protected data-API endpoints (/v1/*) can also return these when the
+// middleware isUserSignedOutAll check fires — see headlo-worker/src/middleware/auth.ts.
+export const REVOCATION_ERROR_CODES = new Set([
+  'SESSION_REVOKED',
+  'REVOKED_BY_PASSWORD_RESET',
+  'REVOKED',
+  'LEGACY_TOKEN_REAUTH_REQUIRED',
+  'DPOP_KEY_REVOKED',
+  'CONSENT_REVOKED',
+])
+
+/** Returns true when a 401/403 response body's `error` field names a revocation code. */
+export function isRevocationCode(code: string | undefined | null): boolean {
+  return typeof code === 'string' && REVOCATION_ERROR_CODES.has(code)
+}
+
 export interface HeadloAuthClientV2Config {
   publishableKey:             string
   issuer:                     string
   signInForceRedirectUrl?:    string
   signInFallbackRedirectUrl?: string
+  /**
+   * SSO Wave 1 B.8 close-out — auto-sign-out on server-side revocation.
+   *
+   * When the Provider's silent refresh (`/oauth/token/refresh-dpop`) or
+   * resurrection call (`/oauth/dpop/mint`) returns a 401 whose body carries
+   * a revocation marker (`SESSION_REVOKED`, `REVOKED_BY_PASSWORD_RESET`,
+   * `REVOKED`, `LEGACY_TOKEN_REAUTH_REQUIRED`, `DPOP_KEY_REVOKED`), the SDK
+   * clears sessionStorage + IndexedDB + user cache + BroadcastChannels the
+   * event to peer tabs — effectively flipping `isSignedIn` to false within
+   * ~15s of a server-side `/oauth/signout-all` call.
+   *
+   * Default `true`. Set `false` only if you want to intercept 401s yourself
+   * (e.g. custom retry logic, A/B test, dashboard-side admin tools that
+   * need to inspect the raw 401 before the SDK pre-empts them).
+   */
+  autoSignOutOnRevocation?:   boolean
   /**
    * Optional platform adapter. Web (default, omitted) uses `window.location`
    * to redirect the tab for sign-in and reads the auth callback from URL
@@ -775,9 +824,19 @@ export class HeadloAuthClientV2 {
         if (res.status === 401 || res.status === 403) {
           const body = await res.json().catch(() => null) as { error?: string } | null
           const errCode = typeof body?.error === 'string' ? body.error : ''
-          if (errCode === 'DPOP_KEY_REVOKED') {
-            log(`❌ /oauth/token/refresh-dpop → ${res.status} DPOP_KEY_REVOKED — clearing local`, { tookMs: took })
-            this.clearSession()
+          // SSO Wave 1 B.8 close-out — expanded revocation detection. Any
+          // code in REVOCATION_ERROR_CODES means the server has definitively
+          // revoked this session; local state is dead weight. Previously
+          // only DPOP_KEY_REVOKED triggered the clear; SESSION_REVOKED (from
+          // signout-all) and REVOKED_BY_PASSWORD_RESET + REVOKED were being
+          // silently ignored, leaving the UI "signed in" until next close.
+          if (isRevocationCode(errCode)) {
+            if (this.config.autoSignOutOnRevocation !== false) {
+              log(`❌ /oauth/token/refresh-dpop → ${res.status} ${errCode} — auto-signing out`, { tookMs: took })
+              this.clearSession()
+            } else {
+              log(`❌ /oauth/token/refresh-dpop → ${res.status} ${errCode} — revocation detected but autoSignOutOnRevocation=false, keeping local state`, { tookMs: took })
+            }
             return null
           }
           log(`⚠️ /oauth/token/refresh-dpop → ${res.status} ${errCode || 'unspecified'} — keeping session (refresh failed but token cache preserved)`, { tookMs: took })
@@ -848,9 +907,13 @@ export class HeadloAuthClientV2 {
         // caller sees "not signed in for now" without losing state.
         const body = await res.json().catch(() => null) as { error?: string } | null
         const errCode = typeof body?.error === 'string' ? body.error : ''
-        if (errCode === 'DPOP_KEY_REVOKED') {
-          log(`❌ /oauth/dpop/mint → ${res.status} DPOP_KEY_REVOKED — clearing local`, { tookMs: took })
-          this.clearSession()
+        if (isRevocationCode(errCode)) {
+          if (this.config.autoSignOutOnRevocation !== false) {
+            log(`❌ /oauth/dpop/mint → ${res.status} ${errCode} — auto-signing out`, { tookMs: took })
+            this.clearSession()
+          } else {
+            log(`❌ /oauth/dpop/mint → ${res.status} ${errCode} — revocation detected but autoSignOutOnRevocation=false, keeping local state`, { tookMs: took })
+          }
           return null
         }
         log(`⚠️ /oauth/dpop/mint → ${res.status} ${errCode || 'unspecified'} — keeping session`, { tookMs: took })
@@ -886,6 +949,25 @@ export class HeadloAuthClientV2 {
       writeCachedUser(u, this.config.storageKey)
     }
     this.emit()
+  }
+
+  /**
+   * SSO Wave 1 § 7.4.2 — externally-triggered sign-out. Called by
+   * `createAuthFetch` when a merchant's protected endpoint returns a 401
+   * whose body carries a revocation marker (SESSION_REVOKED and friends).
+   * Mirrors what the silent refresh timer does when it detects revocation on
+   * `/oauth/token/refresh-dpop`.
+   *
+   * No-op when `autoSignOutOnRevocation: false` was passed in config —
+   * merchant has opted into handling 401s themselves.
+   */
+  handleRevocation(code: string): void {
+    if (this.config.autoSignOutOnRevocation === false) {
+      log(`❌ external 401 ${code} — revocation detected but autoSignOutOnRevocation=false, keeping local state`)
+      return
+    }
+    log(`❌ external 401 ${code} — auto-signing out (triggered by createAuthFetch wrapper)`)
+    this.clearSession()
   }
 
   private clearSession(): void {

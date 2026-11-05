@@ -1,6 +1,7 @@
 import React from 'react'
 import { HeadloAuthClientV2 } from './client-v2'
 import { HeadloAuthContext } from './HeadloProviderV1'
+import { decodePublishableKey } from './pk'
 import type { HeadloAuthContextValue, HeadloProviderProps } from './types'
 
 // HeadloProviderV2 — Anchor-Bound Session (ABS) React SDK.
@@ -22,12 +23,29 @@ console.log(`%c[headlo-auth-v2]%c 📦 SDK build: ${HEADLO_AUTH_V2_VERSION}`, 'c
 
 export function HeadloProviderV2({
   publishableKey,
-  issuer = DEFAULT_ISSUER,
+  issuer,
   signInForceRedirectUrl,
   signInFallbackRedirectUrl,
   platformAdapter,
+  autoSignOutOnRevocation,
   children,
 }: HeadloProviderProps) {
+  // Issuer resolution — three-tier precedence:
+  //   1. Explicit `issuer` prop (back-compat; merchants on legacy raw-hex pks
+  //      and anyone overriding for dev purposes).
+  //   2. Wave 4 B.6 — hostname embedded in the publishable key itself. The
+  //      pk encodes `{hostname}${keyId}` in base64url; the decoder returns
+  //      the full `https://host` URL (http for localhost/127.*).
+  //   3. DEFAULT_ISSUER constant (last-resort fallback for anyone whose pk
+  //      is still raw-hex AND who didn't pass an issuer prop — prevents a
+  //      cryptic "fetch to undefined" at init time).
+  const resolvedIssuer = React.useMemo(() => {
+    if (issuer) return issuer
+    const decoded = decodePublishableKey(publishableKey)
+    if (decoded.isEncoded && decoded.issuer) return decoded.issuer
+    return DEFAULT_ISSUER
+  }, [publishableKey, issuer])
+
   // Client instance — owned by this provider, never re-created. Held in a
   // ref rather than state because the client owns its own state; the
   // provider just mirrors it into React state via onChange.
@@ -35,10 +53,11 @@ export function HeadloProviderV2({
   if (!clientRef.current) {
     clientRef.current = new HeadloAuthClientV2({
       publishableKey,
-      issuer,
+      issuer: resolvedIssuer,
       signInForceRedirectUrl,
       signInFallbackRedirectUrl,
       platformAdapter,
+      autoSignOutOnRevocation,
     })
   }
   const client = clientRef.current
@@ -103,13 +122,17 @@ export function HeadloProviderV2({
   // Bind methods once — using useCallback-like memoization via useMemo so
   // context consumers don't see new function refs every render.
   const value = React.useMemo<HeadloAuthContextValue>(() => ({
-    isLoaded:       state.isLoaded,
-    isSignedIn:     state.isSignedIn,
-    user:           state.user,
-    getToken:       () => client.getToken(),
-    signIn:         (opts) => client.signIn(opts),
-    signOut:        () => client.signOut(),
+    isLoaded:          state.isLoaded,
+    isSignedIn:        state.isSignedIn,
+    user:              state.user,
+    getToken:          () => client.getToken(),
+    signIn:            (opts) => client.signIn(opts),
+    signOut:           () => client.signOut(),
     publishableKey,
+    // SSO Wave 1 § 7.4.2 — called by createAuthFetch on merchant-endpoint 401s
+    // whose body carries a revocation marker. Mirrors the refresh-path auto-
+    // sign-out shipped in § 7.1.
+    _handleRevocation: (code) => client.handleRevocation(code),
   }), [state, client, publishableKey])
 
   return (
